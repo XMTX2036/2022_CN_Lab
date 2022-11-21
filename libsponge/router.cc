@@ -29,14 +29,34 @@ void Router::add_route(const uint32_t route_prefix,
     cerr << "DEBUG: adding route " << Address::from_ipv4_numeric(route_prefix).ip() << "/" << int(prefix_length)
          << " => " << (next_hop.has_value() ? next_hop->ip() : "(direct)") << " on interface " << interface_num << "\n";
 
-    DUMMY_CODE(route_prefix, prefix_length, next_hop, interface_num);
+    // DUMMY_CODE(route_prefix, prefix_length, next_hop, interface_num);
     // Your code here.
+    _router_table.push_back({route_prefix, prefix_length, next_hop, interface_num});
 }
 
 //! \param[in] dgram The datagram to be routed
 void Router::route_one_datagram(InternetDatagram &dgram) {
-    DUMMY_CODE(dgram);
-    // Your code here.
+    const uint32_t dst_ip_addr = dgram.header().dst;
+    size_t size = _router_table.size();
+    size_t max_matched_idx = size;
+
+    for(size_t i=0; i<size; i++) {
+        uint32_t mask = 0;
+        if (_router_table[i].prefix_length > 0) mask = ~((1 << (32 - _router_table[i].prefix_length)) - 1);
+        
+        if ((_router_table[i].prefix_length == 0) || (_router_table[i].route_prefix == (dgram.header().dst & mask))) {
+            if(max_matched_idx == size || _router_table[i].prefix_length >= _router_table[i].prefix_length) 
+                max_matched_idx = i;
+        }
+    }
+
+    if(max_matched_idx == size || dgram.header().ttl-- <= 1) return;
+    else{
+        const optional<Address> next_hop = _router_table[max_matched_idx].next_hop;
+        AsyncNetworkInterface &interface = _interfaces[_router_table[max_matched_idx].interface_num];
+        if(next_hop.has_value()) interface.send_datagram(dgram, next_hop.value());
+        else interface.send_datagram(dgram, Address::from_ipv4_numeric(dst_ip_addr));
+    }
 }
 
 void Router::route() {
