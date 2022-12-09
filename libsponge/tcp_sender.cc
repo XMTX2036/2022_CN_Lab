@@ -10,7 +10,7 @@
 // automated checks run by `make check_lab3`.
 
 template <typename... Targs>
-void DUMMY_CODE(Targs &&... /* unused */) {}
+void DUMMY_CODE(Targs &&.../* unused */) {}
 
 using namespace std;
 
@@ -22,100 +22,111 @@ TCPSender::TCPSender(const size_t capacity, const uint16_t retx_timeout, const s
     , _initial_retransmission_timeout{retx_timeout}
     , _stream(capacity) {}
 
-uint64_t TCPSender::bytes_in_flight() const { return _bytes_in_flight; }
+uint64_t TCPSender::bytes_in_flight() const { return _outgoing_bytes; }
 
 void TCPSender::fill_window() {
-    // 1. 如果远程窗口大小为 0,则把其视为1进行操作
-    size_t current_window_size;
-    if(!_last_window_size) current_window_size = 1;
-    else current_window_size = _last_window_size;
-    // 2. 循环填充窗口
-    while (current_window_size > _bytes_in_flight) {
-        // 2.1 如果尚未发送SYN数据包，则设置header的syn位
+    // 如果远程窗口大小为 0, 则把其视为 1 进行操作
+    size_t curr_window_size = _last_window_size ? _last_window_size : 1;
+    // 循环填充窗口
+    while (curr_window_size > _outgoing_bytes) {
+        // 尝试构造单个数据包
+        // 如果此时尚未发送 SYN 数据包，则立即发送
         TCPSegment segment;
-        if (!_syn_set) {
+        if (!_set_syn_flag) {
             segment.header().syn = true;
-            _syn_set = true;
+            _set_syn_flag = true;
         }
-        // 2.2&2.3 设置 seqno 和 payload
+        // 设置 seqno
         segment.header().seqno = next_seqno();
 
+        // 装入 payload.
         const size_t payload_size =
-            min(TCPConfig::MAX_PAYLOAD_SIZE, current_window_size - _bytes_in_flight - segment.header().syn);
+            min(TCPConfig::MAX_PAYLOAD_SIZE, curr_window_size - _outgoing_bytes - segment.header().syn);
         string payload = _stream.read(payload_size);
 
-        // 2.4 若满足条件则增加FIN
-        if (!_fin_set // 2.4.1. 从来没发送过 FIN
-            && _stream.eof() // 2.4.2 输入字节流处于 EOF
-            && payload.size()+_bytes_in_flight < current_window_size // 2.4.3 window减去payload大小后，仍可存放下FIN
-            )
-            _fin_set = segment.header().fin = true;
+        /**
+         * 读取好后，如果满足以下条件，则增加 FIN
+         *  1. 从来没发送过 FIN
+         *  2. 输入字节流处于 EOF
+         *  3. window 减去 payload 大小后，仍然可以存放下 FIN
+         */
+        if (!_set_fin_flag && _stream.eof() && payload.size() + _outgoing_bytes < curr_window_size)
+            _set_fin_flag = segment.header().fin = true;
 
-        segment.payload() = Buffer(std::move(payload));
+        segment.payload() = Buffer(move(payload));
 
-        // 2.5 如果没有任何数据，则停止数据包的发送
-        if(!segment.length_in_sequence_space()) return;
+        // 如果没有任何数据，则停止数据包的发送
+        if (segment.length_in_sequence_space() == 0)
+            break;
 
-        // 2.6 如果没有正在等待的数据包，则重设更新时间
-        if (_segments_outstanding.empty()) {
+        // 如果没有正在等待的数据包，则重设更新时间
+        if (_outgoing_map.empty()) {
             _timeout = _initial_retransmission_timeout;
-            _ms_current = 0;
+            _timecount = 0;
         }
 
-        // 2.7 发送数据包并追踪；更新待发送的absseqno
-        // 2.7.1 发送
-        _segments_out.push(segment); 
-        // 2.7.2 追踪数据包
-        _bytes_in_flight += segment.length_in_sequence_space();
-        _segments_outstanding.insert(make_pair(_next_seqno, segment));
-        // 2.7.3 更新待发送absseqno
+        // 发送
+        _segments_out.push(segment);
+
+        // 追踪这些数据包
+        _outgoing_bytes += segment.length_in_sequence_space();
+        _outgoing_map.insert(make_pair(_next_seqno, segment));
+        // 更新待发送 abs seqno
         _next_seqno += segment.length_in_sequence_space();
 
-        // 2.8 如果设置了fin,则直接退出填充window的操作
-        if (segment.header().fin) break;
+        // 如果设置了 fin，则直接退出填充 window 的操作
+        if (segment.header().fin)
+            break;
     }
 }
 
 //! \param ackno The remote receiver's ackno (acknowledgment number)
 //! \param window_size The remote receiver's advertised window size
 void TCPSender::ack_received(const WrappingInt32 ackno, const uint16_t window_size) {
-    uint64_t abs_seqno = unwrap(ackno, _isn, _next_seqno);
-    // 1. 如果传入的 ack 是不可靠的，则直接丢弃
-    if(abs_seqno > _next_seqno) return;
-    // 2. 遍历数据结构，将已经接收到的数据包丢弃
-    auto iter = _segments_outstanding.begin();
-    while(iter != _segments_outstanding.end()) {
-        // 2.1 如果一个发送的数据包已经被成功接收
-        if (iter->first + iter->second.length_in_sequence_space() <= abs_seqno) {
-            _bytes_in_flight -= iter->second.length_in_sequence_space();
-            iter = _segments_outstanding.erase(iter);
+    size_t abs_seqno = unwrap(ackno, _isn, _next_seqno);
+    // 如果传入的 ack 是不可靠的，则直接丢弃
+    if (abs_seqno > _next_seqno)
+        return;
+    // 遍历数据结构，将已经接收到的数据包丢弃
+    for (auto iter = _outgoing_map.begin(); iter != _outgoing_map.end();) {
+        // 如果一个发送的数据包已经被成功接收
+        const TCPSegment &seg = iter->second;
+        if (iter->first + seg.length_in_sequence_space() <= abs_seqno) {
+            _outgoing_bytes -= seg.length_in_sequence_space();
+            iter = _outgoing_map.erase(iter);
+
+            // 如果有新的数据包被成功接收，则清空超时时间
             _timeout = _initial_retransmission_timeout;
-            _ms_current = 0; // 2.2 从追踪列表中丢弃并清空超时时间
-        } else break;
+            _timecount = 0;
+        }
+        // 如果当前遍历到的数据包还没被接收，则说明后面的数据包均未被接收，因此直接返回
+        else
+            break;
     }
-    // 3. 调用fill_window继续填充数据
-    _consecutive_retransmissions = 0;
+    _consecutive_retransmissions_count = 0;
+    // 填充后面的数据
     _last_window_size = window_size;
     fill_window();
 }
 
 //! \param[in] ms_since_last_tick the number of milliseconds since the last call to this method
 void TCPSender::tick(const size_t ms_since_last_tick) {
-    _ms_current += ms_since_last_tick;
+    _timecount += ms_since_last_tick;
 
-    auto iter = _segments_outstanding.begin();
+    auto iter = _outgoing_map.begin();
     // 如果存在发送中的数据包，并且定时器超时
-    if (iter != _segments_outstanding.end() && _ms_current >= _timeout) {
+    if (iter != _outgoing_map.end() && _timecount >= _timeout) {
         // 如果窗口大小不为0还超时，则说明网络拥堵
-        if(_last_window_size > 0) _timeout *= 2;
-        _ms_current = 0;
+        if (_last_window_size > 0)
+            _timeout *= 2;
+        _timecount = 0;
         _segments_out.push(iter->second);
         // 连续重传计时器增加
-        ++_consecutive_retransmissions;
+        ++_consecutive_retransmissions_count;
     }
 }
 
-unsigned int TCPSender::consecutive_retransmissions() const { return _consecutive_retransmissions; }
+unsigned int TCPSender::consecutive_retransmissions() const { return _consecutive_retransmissions_count; }
 
 void TCPSender::send_empty_segment() {
     TCPSegment segment;

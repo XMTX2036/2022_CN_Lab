@@ -7,8 +7,8 @@
 #include "wrapping_integers.hh"
 
 #include <functional>
-#include <queue>
 #include <map>
+#include <queue>
 
 //! \brief The "sender" part of a TCP implementation.
 
@@ -19,15 +19,15 @@
 class TCPSender {
   private:
     int _timeout{-1};
-    int _ms_current{0};
+    int _timecount{0};
 
-    std::map<size_t, TCPSegment> _segments_outstanding{};
-    uint64_t _bytes_in_flight{0};
-    uint _consecutive_retransmissions{0};
+    std::map<size_t, TCPSegment> _outgoing_map{};
+    size_t _outgoing_bytes{0};
+
     size_t _last_window_size{1};
-
-    bool _syn_set{false};
-    bool _fin_set{false};
+    bool _set_syn_flag{false};
+    bool _set_fin_flag{false};
+    size_t _consecutive_retransmissions_count{0};
 
     //! our initial sequence number, the number for our SYN.
     WrappingInt32 _isn;
